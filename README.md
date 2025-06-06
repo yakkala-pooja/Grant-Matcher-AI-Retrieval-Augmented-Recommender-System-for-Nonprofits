@@ -10,6 +10,10 @@ GrantMatch AI is a comprehensive platform that combines grant recommendation wit
 3. Assess data quality and completeness
 4. Provide a user-friendly dashboard for exploring recommendations and alerts
 
+## Data Set Link
+
+[Dataset](https://www.kaggle.com/datasets/poojayakkala/nonprofit-organizations-and-grants-synthetic-data/data)
+
 ## 📊 Project Statistics
 - **Total Lines of Code**: 1,232
 - **Python Files**: 1,232 lines
