@@ -1,0 +1,116 @@
+{
+    "intro": [
+        "Offered by the {agency}, this opportunity",
+        "The {agency} is offering this grant to",
+        "This {agency} funding opportunity aims to",
+        "Under this initiative, the {agency} seeks to",
+        "The {agency} has established this grant program to"
+    ],
+    "purpose": {
+        "Science": [
+            "advance scientific research in {title}",
+            "support innovative research focusing on {title}",
+            "fund breakthrough scientific investigations in {title}"
+        ],
+        "Education": [
+            "enhance educational opportunities through {title}",
+            "improve educational outcomes via {title}",
+            "strengthen educational programs focusing on {title}"
+        ],
+        "Environment": [
+            "protect and preserve environmental resources through {title}",
+            "support environmental conservation efforts focusing on {title}",
+            "advance environmental sustainability via {title}"
+        ],
+        "Health": [
+            "improve health outcomes through {title}",
+            "enhance healthcare delivery via {title}",
+            "advance public health initiatives focusing on {title}"
+        ],
+        "Economic": [
+            "stimulate economic development through {title}",
+            "support economic growth initiatives via {title}",
+            "enhance economic opportunities focusing on {title}"
+        ],
+        "Community": [
+            "strengthen community resources through {title}",
+            "enhance community development via {title}",
+            "support community-based initiatives focusing on {title}"
+        ],
+        "Other": [
+            "support initiatives related to {title}",
+            "fund programs focusing on {title}",
+            "advance projects addressing {title}"
+        ]
+    },
+    "eligibility": [
+        "This opportunity is open to {eligible_types}.",
+        "Eligible applicants include {eligible_types}.",
+        "Applications are welcomed from {eligible_types}."
+    ],
+    "ntee_missions": {
+        "A": {
+            "theme": "Arts and Culture",
+            "templates": [
+                "We enrich {city}, {state} through the preservation and promotion of arts and culture.",
+                "Our mission is to foster cultural growth in {city} through innovative artistic programs."
+            ]
+        },
+        "B": {
+            "theme": "Education",
+            "templates": [
+                "We empower learners in {city}, {state} through quality education programs.",
+                "Our mission is to transform education in {city} through innovative learning initiatives."
+            ]
+        },
+        "C": {
+            "theme": "Environment",
+            "templates": [
+                "We protect and preserve the natural environment in {city}, {state}.",
+                "Our mission is to safeguard ecological resources in {city}."
+            ]
+        },
+        "D": {
+            "theme": "Animal Welfare",
+            "templates": [
+                "We advocate for animal welfare in {city}, {state}.",
+                "Our mission is to improve the lives of animals in {city}."
+            ]
+        },
+        "E": {
+            "theme": "Health",
+            "templates": [
+                "We improve health outcomes in {city}, {state} through innovative healthcare programs.",
+                "Our mission is to enhance healthcare access and quality in {city}."
+            ]
+        },
+        "P": {
+            "theme": "Human Services",
+            "templates": [
+                "We strengthen lives in {city}, {state} through comprehensive human services.",
+                "Our mission is to empower individuals and families in {city}."
+            ]
+        },
+        "S": {
+            "theme": "Community Improvement",
+            "templates": [
+                "We build stronger communities in {city}, {state}.",
+                "Our mission is to revitalize and strengthen {city}."
+            ]
+        },
+        "X": {
+            "theme": "Religion",
+            "templates": [
+                "We foster spiritual growth and community service in {city}, {state}.",
+                "Our mission is to support faith-based initiatives in {city}."
+            ]
+        },
+        "OTHER": {
+            "theme": "Community Service",
+            "templates": [
+                "We serve the {city}, {state} community through various programs.",
+                "Our mission is to improve quality of life in {city}."
+            ]
+        }
+    }
+} 
