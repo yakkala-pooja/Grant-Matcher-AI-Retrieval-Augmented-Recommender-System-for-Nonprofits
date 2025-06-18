@@ -99,6 +99,7 @@ def save_funder_nonprofit_mapping(mapping: Dict[str, List[Dict]], output_dir: st
             json.dump(funder_data, f, indent=2, default=str)
     with open(os.path.join(output_dir, 'funding_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary_data, f, indent=2, default=str) # Save summary file
+
 def load_grants_data(file_path: str) -> pd.DataFrame:
     """Load and preprocess grants data from CSV file."""
     df = pd.read_csv(file_path)
@@ -147,34 +148,54 @@ def load_nonprofits_data(file_path: str, funder_history_path: str = None) -> Tup
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
+    
     text_cols = ['NAME', 'mission_statement', 'STREET', 'CITY', 'STATE']
     for col in text_cols: # Clean text columns
         if col in df.columns:
             df[col] = df[col].apply(clean_text)
-    numeric_cols = ['ASSET_AMT', 'INCOME_AMT', 'REVENUE_AMT', 'impact_score', 'anomaly_score']
-    for col in numeric_cols: # Convert numeric columns
+    
+    # Handle revenue and financial data first
+    financial_cols = ['ASSET_AMT', 'INCOME_AMT', 'REVENUE_AMT']
+    for col in financial_cols:
+        if col in df.columns:
+            # Convert any currency strings to numeric
+            df[col] = df[col].apply(convert_currency_to_float)
+            # Ensure non-negative values
+            df.loc[df[col] < 0, col] = np.nan
+    
+    # Other numeric columns
+    other_numeric_cols = ['impact_score', 'anomaly_score']
+    for col in other_numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     categorical_cols = ['risk_level', 'anomaly_type', 'impact_score']
     for col in categorical_cols: # Handle categorical columns
         if col in df.columns:
             df[col] = df[col].fillna('Low')  # Default to Low for missing values
+    
     if 'is_anomalous' in df.columns: # Handle boolean columns
         df['is_anomalous'] = df['is_anomalous'].fillna(False)
+    
     if 'ZIP' in df.columns:  # Handle ZIP codes
         df['ZIP'] = df['ZIP'].astype(str).str.zfill(5)
+    
     df = df.dropna(subset=['mission_statement']) # Clean and validate data
     df = df[df['mission_statement'].str.strip() != '']
+    
     default_values = { # Fill missing values
         'NAME': 'Unknown Organization', 'EIN': 'NOT_PROVIDED',
         'STATE': 'NA', 'risk_level': 'Low',
-        'anomaly_type': 'normal', 'is_anomalous': False, 'anomaly_score': 0.0}
+        'anomaly_type': 'normal', 'is_anomalous': False, 'anomaly_score': 0.0
+    }
     df = df.fillna(default_values)
+    
     funder_mapping = None # Process funder history if provided
     if funder_history_path and os.path.exists(funder_history_path):
         funder_history_df = load_funder_history(funder_history_path)
         funder_mapping = create_funder_nonprofit_mapping(funder_history_df)
         save_funder_nonprofit_mapping(funder_mapping, 'funder_history')
+    
     return df, funder_mapping
 
 def prepare_data_for_embedding(df: pd.DataFrame) -> Tuple[list, list]:

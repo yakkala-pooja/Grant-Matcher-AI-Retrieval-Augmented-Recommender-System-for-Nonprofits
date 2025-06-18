@@ -10,12 +10,10 @@ GrantMatch AI is a comprehensive platform that combines grant recommendation wit
 3. Assess data quality and completeness
 4. Provide a user-friendly dashboard for exploring recommendations and alerts
 
-## Data Set Link
-
-[Dataset](https://www.kaggle.com/datasets/poojayakkala/nonprofit-organizations-and-grants-synthetic-data/data)
-
 ## 📊 Project Statistics
-- **Total Lines of Code**: 1,232
+- **Total Nonprofits**: 240,585
+- **High Quality Profiles**: 114,834
+- **Anomaly Records**: 189,233
 - **Python Files**: 1,232 lines
   - data_loader.py: 183 lines
   - grant_recommender.py: 235 lines
@@ -273,3 +271,28 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 🔄 Recent Updates
+
+### Fraud & Anomaly Detection
+- Enhanced fraud alerts interface with improved visualizations
+- Added interactive risk level filtering system
+- Implemented comprehensive anomaly scoring
+- Added detailed nonprofit alert details with quality and risk metrics
+- Improved financial metric display and formatting
+- Added multi-level filtering for risk, quality, and anomaly alerts
+
+### Grant Matching System
+- Improved semantic similarity scoring using all-MiniLM-L6-v2 model
+- Enhanced grant recommendation relevance with better scoring normalization
+- Added detailed match analysis with scoring breakdown
+- Fixed agency name display in grant matches
+- Improved grant title and description handling
+- Added support for 114,834 high-quality nonprofit profiles
+
+### Technical Improvements
+- Optimized data loading with session state management
+- Enhanced model initialization and persistence
+- Improved error handling and logging
+- Fixed pandas SettingWithCopyWarning in data processing
+- Added proper bounds checking for FAISS search results

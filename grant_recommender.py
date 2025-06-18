@@ -19,27 +19,247 @@ logging.basicConfig( # Configure logging
 logger = logging.getLogger(__name__)
 
 class GrantRecommender:
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
-        """
-        Initialize the Grant Recommender system.
-        Args: model_name (str): Name of the SentenceTransformer model to use
-        """
-        logger.info(f"Initializing GrantRecommender with model: {model_name}")
-        self.model_name = model_name
-        self.model = None
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        """Initialize the recommender with a sentence transformer model."""
+        self.model = SentenceTransformer(model_name)
         self.index = None
-        self.grants_data = None
-        self.grant_ids = None
+        self.data = None
         self.embeddings = None
+        self.grant_ids = None
         self.tfidf = TfidfVectorizer(
-            stop_words='english', ngram_range=(1, 2),
-            max_features=1000)
+            max_features=10000, 
+            stop_words='english',
+            ngram_range=(1, 2)
+        )
         self.grant_tfidf_matrix = None
-        self.funder_preferences = None
-        self._term_pattern = re.compile(
-            r'\b\w+(?:tion|ing|ment|ship)\b|\b\w+ (?:program|service|support)s?\b')
-        logger.info("GrantRecommender initialized")
-        
+        logger.info(f"GrantRecommender initialized with model: {model_name}")
+
+    def fit(self, data_path: str) -> None:
+        """Build the FAISS index from grant descriptions."""
+        try:
+            # Load and preprocess data
+            self.grants_data = load_grants_data(data_path)
+            texts, self.grant_ids = prepare_data_for_embedding(self.grants_data)
+            
+            # Generate embeddings
+            self.embeddings = self._compute_embeddings(texts)
+            
+            # Fit TF-IDF vectorizer
+            self.tfidf.fit(texts)
+            self.grant_tfidf_matrix = self.tfidf.transform(texts)
+            
+            # Initialize and train FAISS index
+            dimension = self.embeddings.shape[1]
+            if len(texts) < 10000:
+                self.index = faiss.IndexFlatL2(dimension)
+            else:
+                quantizer = faiss.IndexFlatL2(dimension)
+                self.index = faiss.IndexIVFFlat(quantizer, dimension, 100)
+                self.index.train(self.embeddings)
+            self.index.add(self.embeddings)
+            
+            logger.info(f"Successfully loaded and fit model with {len(texts)} grants")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error fitting model: {str(e)}")
+            raise
+
+    def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Compute embeddings for a list of texts."""
+        try:
+            embeddings = self.model.encode(texts, show_progress_bar=True)
+            logger.info(f"Successfully computed embeddings with shape {embeddings.shape}")
+            return embeddings
+        except Exception as e:
+            logger.error(f"Error computing embeddings: {str(e)}")
+            raise
+
+    def save_model(self, output_dir):
+        """Save the model data and FAISS index."""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Save FAISS index
+            index_path = os.path.join(output_dir, 'faiss_index.bin')
+            faiss.write_index(self.index, index_path)
+            logger.info(f"Saved FAISS index to {index_path}")
+            
+            # Save model data
+            data_path = os.path.join(output_dir, 'model_data.pkl')
+            model_data = {
+                'grants_data': self.grants_data,
+                'grant_ids': self.grant_ids,
+                'grant_tfidf_matrix': self.grant_tfidf_matrix,
+                'tfidf_vocabulary': self.tfidf.vocabulary_,
+                'tfidf_idf': self.tfidf.idf_
+            }
+            with open(data_path, 'wb') as f:
+                pickle.dump(model_data, f)
+            logger.info(f"Saved model data to {data_path}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error saving model: {str(e)}")
+            raise
+
+    @classmethod
+    def load_model(cls, model_dir):
+        """Load a pre-trained model from directory."""
+        try:
+            recommender = cls()
+            
+            # Load FAISS index
+            index_path = os.path.join(model_dir, 'faiss_index.bin')
+            recommender.index = faiss.read_index(index_path)
+            logger.info("FAISS index loaded successfully")
+            
+            # Load model data
+            data_path = os.path.join(model_dir, 'model_data.pkl')
+            with open(data_path, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            recommender.grants_data = model_data['grants_data']
+            recommender.grant_ids = model_data['grant_ids']
+            recommender.grant_tfidf_matrix = model_data['grant_tfidf_matrix']
+            recommender.tfidf.vocabulary_ = model_data['tfidf_vocabulary']
+            recommender.tfidf.idf_ = model_data['tfidf_idf']
+            
+            logger.info("Model data loaded successfully")
+            return recommender
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise
+
+    def find_matches(self, query, k=5):
+        """Find the top k matching grants for a query."""
+        try:
+            if not self.index:
+                raise ValueError("Model not loaded. Call load_model first.")
+            
+            # Encode query
+            query_vector = self.model.encode([query])[0]
+            query_vector = query_vector.reshape(1, -1)
+            
+            # Get more candidates for reranking
+            k_candidates = min(k * 3, len(self.grant_ids))
+            distances, indices = self.index.search(query_vector, k_candidates)
+            
+            # Convert L2 distances to cosine similarities
+            # Using modified formula for better score distribution
+            semantic_similarities = np.exp(-distances[0] / 4)  # Exponential scaling
+            
+            # Get TF-IDF score for query
+            query_tfidf = self.tfidf.transform([query])
+            
+            # Compute TF-IDF similarities for candidates
+            matches = []
+            
+            # Track max TF-IDF score for normalization
+            max_tfidf_score = float('-inf')
+            candidate_matches = []
+            
+            for idx, semantic_score in zip(indices[0], semantic_similarities):
+                if idx < 0 or idx >= len(self.grant_ids):
+                    continue
+                
+                # Get TF-IDF similarity
+                grant_tfidf = self.grant_tfidf_matrix[idx]
+                tfidf_score = float((query_tfidf * grant_tfidf.T).toarray()[0][0])
+                max_tfidf_score = max(max_tfidf_score, tfidf_score)
+                
+                # Get grant data
+                grant_id = self.grant_ids[idx]
+                grant_data = self.grants_data[self.grants_data['opportunity_number'] == grant_id].iloc[0]
+                
+                # Clean up title and description
+                title = grant_data.get('opportunity_title', '').strip()
+                desc = grant_data.get('grant_description', '').strip()
+                
+                # If title is too long or looks like a description, try to extract a shorter title
+                if len(title) > 100 or title.lower().startswith('notice of'):
+                    # Try to extract a cleaner title from the first sentence
+                    sentences = title.split('.')
+                    title = sentences[0].strip()
+                    if len(sentences) > 1:
+                        desc = ' '.join(sentences[1:]).strip() + ' ' + desc
+                
+                match = grant_data.to_dict()
+                match['opportunity_title'] = title
+                match['grant_description'] = desc
+                match['semantic_score'] = semantic_score
+                match['tfidf_score'] = tfidf_score
+                candidate_matches.append(match)
+            
+            # Normalize TF-IDF scores and compute final scores
+            if max_tfidf_score > 0:
+                for match in candidate_matches:
+                    # Normalize TF-IDF score
+                    match['tfidf_score'] = match['tfidf_score'] / max_tfidf_score
+                    
+                    # Apply sigmoid scaling to both scores for better distribution
+                    semantic_scaled = 1 / (1 + np.exp(-6 * (match['semantic_score'] - 0.5)))
+                    tfidf_scaled = 1 / (1 + np.exp(-6 * (match['tfidf_score'] - 0.5)))
+                    
+                    # Combine scores (70% semantic + 30% TF-IDF)
+                    match['similarity_score'] = (0.7 * semantic_scaled) + (0.3 * tfidf_scaled)
+                    
+                    # Update individual scores for display
+                    match['semantic_score'] = semantic_scaled
+                    match['tfidf_score'] = tfidf_scaled
+                    
+                    # Generate match justification
+                    match['match_justification'] = self._generate_justification(
+                        query,
+                        match['opportunity_title'],
+                        match['grant_description'],
+                        match.get('funding_instrument_type', ''),
+                        match.get('award_ceiling', 0),
+                        match['similarity_score']
+                    )
+                    
+                    matches.append(match)
+            
+            # Sort by combined score and return top k
+            matches.sort(key=lambda x: x['similarity_score'], reverse=True)
+            return matches[:k]
+            
+        except Exception as e:
+            logger.error(f"Error finding matches: {str(e)}")
+            raise
+
+    def load_data_chunk(self, start_idx, chunk_size):
+        """Load a specific chunk of data."""
+        if not self.data_path:
+            raise ValueError("Data path not set. Call load_model first.")
+            
+        chunk_data = []
+        try:
+            with open(self.data_path, 'rb') as f:
+                # Skip to the start position
+                for _ in range(start_idx):
+                    try:
+                        pickle.load(f)
+                    except EOFError:
+                        return []
+                
+                # Read the chunk
+                for _ in range(chunk_size):
+                    try:
+                        item = pickle.load(f)
+                        chunk_data.append(item)
+                    except EOFError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Error loading item: {str(e)}")
+                        continue
+                        
+        except Exception as e:
+            logger.error(f"Error loading data chunk: {str(e)}")
+            
+        return chunk_data
+
     def _init_model(self):
         """Initialize the SentenceTransformer model if not already initialized."""
         if self.model is None:
@@ -94,142 +314,154 @@ class GrantRecommender:
         """Extract key terms from text using precompiled regex patterns with caching."""
         return frozenset(self._term_pattern.findall(text.lower())) if text else frozenset()
     
-    def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Compute embeddings for a list of texts."""
-        logger.info("Computing embeddings...")
-        self._init_model()  # Ensure model is initialized
-        try: # Use larger batch size for efficiency
-            embeddings = self.model.encode(
-                texts, show_progress_bar=True, batch_size=64,  # Increased from 32
-                normalize_embeddings=True, convert_to_tensor=False  # Ensure numpy output
-            )
-            logger.info(f"Successfully computed embeddings with shape {embeddings.shape}")
-            return embeddings.astype(np.float32)
-        except Exception as e:
-            logger.error(f"Error computing embeddings: {str(e)}", exc_info=True)
-            raise
-        
     @lru_cache(maxsize=512)
-    def _generate_justification(self, mission: str, grant_title: str, grant_description: str, grant_funding_type: str, award_ceiling: float, score: float) -> Dict:
-        """
-        Generate detailed justification for why a grant matches a mission statement.
-        Uses caching for repeated matches and optimized text processing.
-        """
-        grant_text = f"{grant_title} {grant_description}"
-        common_terms = self._extract_key_terms(mission) & self._extract_key_terms(grant_text)
-        vectors = self.tfidf.transform([mission, grant_text])
-        feature_names = self.tfidf.get_feature_names_out()
-        shared_keywords = {
-            feature_names[i] for i, v in enumerate(vectors[0].toarray()[0])
-            if v > 0.1} & {
-            feature_names[i] for i, v in enumerate(vectors[1].toarray()[0])
-            if v > 0.1
-        }
-        return {
-            'similarity_score': score, 'common_focus_areas': list(common_terms),
-            'shared_keywords': list(shared_keywords),
-            'alignment_summary': [
-                f"Both focus on: {', '.join(common_terms)}" if common_terms else None,
-                f"Shared themes: {', '.join(shared_keywords)}" if shared_keywords else None],
-            'funding_alignment': [
-                f"Grant offers funding up to ${award_ceiling:,.2f}"
-                if award_ceiling and not pd.isna(award_ceiling) else None,
-                f"Funding type: {grant_funding_type}"
-                if grant_funding_type else None]
-        }
-        
-    def fit(self, data_path: str) -> None:
-        """Build the FAISS index from grant descriptions."""
-        self.grants_data = load_grants_data(data_path) # Load and preprocess data
-        texts, self.grant_ids = prepare_data_for_embedding(self.grants_data)
-        self.embeddings = self._compute_embeddings(texts)
-        self.tfidf.fit(texts) # Fit TF-IDF vectorizer with larger n_jobs
-        self.grant_tfidf_matrix = self.tfidf.transform(texts)
-        dimension = self.embeddings.shape[1] # Initialize and train FAISS index efficiently
-        if len(texts) < 10000:
-            self.index = faiss.IndexFlatL2(dimension)
-        else:
-            quantizer = faiss.IndexFlatL2(dimension)
-            self.index = faiss.IndexIVFFlat(quantizer, dimension, 100)
-            self.index.train(self.embeddings)
-        self.index.add(self.embeddings)
-        
+    def _generate_justification(self, mission: str, grant_title: str, grant_description: str, 
+                              grant_funding_type: str, award_ceiling: float, score: float) -> Dict:
+        """Generate a human-readable justification for the match."""
+        try:
+            # Extract key terms from mission and grant
+            mission_terms = self._extract_key_terms(mission)
+            grant_terms = self._extract_key_terms(grant_title + " " + grant_description)
+            
+            # Find shared keywords
+            shared_keywords = list(mission_terms & grant_terms)
+            
+            # Generate alignment summary
+            alignment_summary = []
+            if score >= 0.8:
+                alignment_summary.append("Very strong alignment with organization's mission")
+            elif score >= 0.6:
+                alignment_summary.append("Good alignment with organization's mission")
+            else:
+                alignment_summary.append("Moderate alignment with organization's mission")
+            
+            # Add funding type alignment
+            funding_alignment = []
+            if grant_funding_type:
+                funding_alignment.append(f"Grant type: {grant_funding_type}")
+            if award_ceiling:
+                funding_alignment.append(f"Maximum award: ${award_ceiling:,.2f}")
+            
+            return {
+                'alignment_summary': alignment_summary,
+                'funding_alignment': funding_alignment,
+                'shared_keywords': shared_keywords[:10]  # Limit to top 10 keywords
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating justification: {str(e)}")
+            return {
+                'alignment_summary': ["Unable to generate detailed alignment analysis"],
+                'funding_alignment': [],
+                'shared_keywords': []
+            }
+
     def get_recommendations(self, mission_statement: str, nonprofit_info: Dict, 
                             top_n: int = 5, min_similarity: float = 0.0) -> List[Dict]:
-        """Get top N matching grants for a given mission statement."""
-        if self.index is None:
-            raise ValueError("Model not fitted yet. Call fit() first.")
-        self._load_funder_preferences() # Initial setup
-        mission_embedding = self._compute_embeddings([mission_statement])
-        search_k = min(top_n * 20, len(self.grant_ids)) #  Configure search parameters
-        if isinstance(self.index, faiss.IndexIVFFlat):
-            self.index.nprobe = 10
-        # Perform search
-        distances, indices = self.index.search(mission_embedding, search_k)
-        similarities = 1 / (1 + distances[0])
-        valid_results = [(idx, sim) for idx, sim in zip(indices[0], similarities) if idx != -1]
-        results = [] # Process results
-        for idx, sim_score in valid_results:
-            if len(results) >= top_n:
-                break
-            grant = self.grants_data[ # Get grant info
-                self.grants_data['opportunity_number'] == self.grant_ids[idx]
-            ].iloc[0].to_dict()
-            boost = self._calculate_boost( # Calculate boost and check thresholds
-                grant['agency_name'].lower(), nonprofit_info.get('ntee_code', ''),
-                nonprofit_info['mission_statement'])
-            score = sim_score * (1 + boost)
-            if score < min_similarity: # Apply filters
-                continue
-            justification = self._generate_justification( # Generate match justification
-                mission=mission_statement, grant_title=grant['opportunity_title'],
-                grant_description=grant['grant_description'], grant_funding_type=grant.get('funding_instrument_type', ''),
-                award_ceiling=grant.get('award_ceiling'), score=score)
-            if boost > 0: # Add boost explanation if applicable
-                justification['alignment_summary'].append(
-                    f"Historical funding patterns suggest good fit (+{boost*100:.1f}% boost)")
-            results.append({ # Build result
-                'opportunity_number': self.grant_ids[idx], 'title': grant['opportunity_title'],
-                'description': grant['grant_description'], 'agency': grant['agency_name'],
-                'award_ceiling': grant.get('award_ceiling'), 'award_floor': grant.get('award_floor'),
-                'funding_instrument_type': grant.get('funding_instrument_type'), 'category': grant.get('category'),
-                'post_date': grant.get('post_date'), 'close_date': grant.get('close_date'),
-                'similarity_score': float(score), 'original_similarity': float(sim_score),
-                'funder_boost': float(boost), 'match_justification': justification})
-        return sorted(results, key=lambda x: x['similarity_score'], reverse=True)
-    
-    def save_model(self, directory: str) -> None:
-        """Save the model and index to disk efficiently."""
-        os.makedirs(directory, exist_ok=True)
-        faiss.write_index(self.index, os.path.join(directory, "faiss_index.bin")) # Save FAISS index
-        with open(os.path.join(directory, "model_data.pkl"), 'wb') as f: # Save other data efficiently
-            pickle.dump({
-                'grants_data': self.grants_data,
-                'grant_ids': self.grant_ids, 'embeddings': self.embeddings,
-                'tfidf': self.tfidf, 'grant_tfidf_matrix': self.grant_tfidf_matrix
-            }, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-    @classmethod
-    def load_model(cls, directory: str) -> 'GrantRecommender':
-        """Load a saved model from disk efficiently."""
-        logger.info(f"Loading model from directory: {directory}")
-        recommender = cls()
+        """Get grant recommendations for a nonprofit."""
         try:
-            index_path = os.path.join(directory, "faiss_index.bin") # Load FAISS index
-            logger.info(f"Loading FAISS index from {index_path}")
-            recommender.index = faiss.read_index(index_path)
-            logger.info("FAISS index loaded successfully")
-            data_path = os.path.join(directory, "model_data.pkl") # Load other data efficiently
-            logger.info(f"Loading model data from {data_path}")
-            with open(data_path, 'rb') as f:
-                data = pickle.load(f)
-                recommender.grants_data = data['grants_data']
-                recommender.grant_ids = data['grant_ids']
-                recommender.embeddings = data['embeddings']
-                recommender.tfidf = data['tfidf']
-                recommender.grant_tfidf_matrix = data['grant_tfidf_matrix']
-            logger.info("Model data loaded successfully")
-            return recommender
+            if not self.index:
+                raise ValueError("Model not loaded. Call fit() or load_model() first.")
+            
+            # Encode mission statement
+            query_vector = self.model.encode([mission_statement])[0]
+            query_vector = query_vector.reshape(1, -1)
+            
+            # Get semantic matches using FAISS
+            k = min(top_n * 3, len(self.grant_ids))  # Get more candidates for reranking
+            distances, indices = self.index.search(query_vector, k)
+            
+            # Convert distances to similarities (1 - normalized distance)
+            similarities = 1 - distances[0] / np.max(distances[0])
+            
+            # Get TF-IDF score for mission statement
+            query_tfidf = self.tfidf.transform([mission_statement])
+            
+            # Compute TF-IDF similarities for candidates
+            tfidf_similarities = []
+            for idx in indices[0]:
+                grant_tfidf = self.grant_tfidf_matrix[idx]
+                similarity = (query_tfidf * grant_tfidf.T).toarray()[0][0]
+                tfidf_similarities.append(similarity)
+            
+            # Combine scores (0.7 semantic + 0.3 TF-IDF)
+            combined_scores = 0.7 * similarities + 0.3 * np.array(tfidf_similarities)
+            
+            # Get matches above threshold
+            matches = []
+            for idx, score in zip(indices[0], combined_scores):
+                if score < min_similarity:
+                    continue
+                    
+                grant = self.grants_data[idx].copy()
+                grant['similarity_score'] = float(score)
+                grant['original_similarity'] = float(score)
+                
+                # Generate match justification
+                grant['match_justification'] = self._generate_justification(
+                    mission_statement,
+                    grant['opportunity_title'],
+                    grant['grant_description'],
+                    grant.get('funding_instrument_type', ''),
+                    grant.get('award_ceiling', 0),
+                    score
+                )
+                
+                matches.append(grant)
+            
+            # Sort by score and return top_n
+            matches.sort(key=lambda x: x['similarity_score'], reverse=True)
+            return matches[:top_n]
+            
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}", exc_info=True)
+            logger.error(f"Error getting recommendations: {str(e)}")
+            raise
+
+    def load_data(self, data_path, chunk_size=1000):
+        """Load model data in chunks to manage memory."""
+        try:
+            data = []
+            with open(data_path, 'rb') as f:
+                while True:
+                    try:
+                        chunk = pickle.load(f)
+                        if isinstance(chunk, list):
+                            data.extend(chunk)
+                        else:
+                            data.append(chunk)
+                    except EOFError:
+                        break
+                    except MemoryError:
+                        logger.warning("Memory limit reached while loading data")
+                        if not data:
+                            raise MemoryError("Not enough memory to load minimum required data")
+                        break
+            self.data = data
+            logger.info(f"Successfully loaded {len(data)} records from {data_path}")
+        except Exception as e:
+            logger.error(f"Error loading data: {str(e)}")
             raise 
+
+    def _init_funder_preferences(self):
+        """Initialize funder preferences from grant data."""
+        self.funder_preferences = {}
+        for grant in self.data:
+            agency = grant.get('agency', '')
+            if agency:
+                if agency not in self.funder_preferences:
+                    self.funder_preferences[agency] = {
+                        'total_grants': 0,
+                        'avg_award': 0,
+                        'categories': set(),
+                        'funding_types': set()
+                    }
+                self.funder_preferences[agency]['total_grants'] += 1
+                if 'award_ceiling' in grant and grant['award_ceiling']:
+                    current_avg = self.funder_preferences[agency]['avg_award']
+                    total = current_avg * (self.funder_preferences[agency]['total_grants'] - 1)
+                    new_avg = (total + grant['award_ceiling']) / self.funder_preferences[agency]['total_grants']
+                    self.funder_preferences[agency]['avg_award'] = new_avg
+                if 'category' in grant:
+                    self.funder_preferences[agency]['categories'].add(grant['category'])
+                if 'funding_instrument_type' in grant:
+                    self.funder_preferences[agency]['funding_types'].add(grant['funding_instrument_type']) 

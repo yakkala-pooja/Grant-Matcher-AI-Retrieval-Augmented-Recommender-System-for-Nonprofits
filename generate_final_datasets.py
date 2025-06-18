@@ -7,6 +7,10 @@ from tqdm import tqdm
 import logging
 from functools import lru_cache
 import gc
+import os
+import pickle
+import faiss
+from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(
@@ -59,21 +63,62 @@ def process_chunk(chunk: pd.DataFrame, is_grant: bool = True) -> pd.DataFrame:
         chunk['grant_description'] = chunk.apply(generate_grant_description, axis=1)
     else:
         chunk = chunk.copy()
-        chunk['REVENUE_AMT'] = pd.to_numeric(chunk['REVENUE_AMT'], errors='coerce').fillna(0)
-        def assign_impact_score(revenue):
-            if pd.isna(revenue) or revenue <= 0:
+        
+        # Print debug info about income values
+        print("\nDebug - Income values before processing:")
+        print(f"Number of records: {len(chunk)}")
+        print(f"Number of non-null INCOME_AMT values: {chunk['INCOME_AMT'].notna().sum()}")
+        print(f"Sample of INCOME_AMT values:\n{chunk['INCOME_AMT'].head()}")
+        
+        # Convert income to numeric but don't fill missing values
+        chunk['INCOME_AMT'] = pd.to_numeric(chunk['INCOME_AMT'], errors='coerce')
+        
+        # Print debug info after conversion
+        print("\nDebug - Income values after numeric conversion:")
+        print(f"Number of non-null INCOME_AMT values: {chunk['INCOME_AMT'].notna().sum()}")
+        print(f"Sample of converted values:\n{chunk['INCOME_AMT'].head()}")
+        print(f"Value counts of impact scores:\n{chunk['INCOME_AMT'].value_counts().head()}")
+        
+        def assign_impact_score(income):
+            if pd.isna(income):
+                return None  # Return None for missing income
+            elif income <= 0:
+                return None  # Return None for zero or negative income
+            elif income <= 100000:  # $100k threshold for Low
                 return 'Low'
-            elif revenue <= 100000:
-                return 'Low'
-            elif revenue <= 1000000:
+            elif income <= 1000000:  # $1M threshold for Medium
                 return 'Medium'
             else:
                 return 'High'
-        chunk['impact_score'] = chunk['REVENUE_AMT'].apply(assign_impact_score)
+        
+        # Assign impact scores based on income
+        chunk['impact_score'] = chunk['INCOME_AMT'].apply(assign_impact_score)
+        
+        # Print impact score distribution
+        print("\nDebug - Impact score distribution:")
+        print(chunk['impact_score'].value_counts())
+        
+        # Create numeric impact score
+        impact_score_map = {'Low': 1.0, 'Medium': 2.0, 'High': 3.0}
+        chunk['impact_score_numeric'] = chunk['impact_score'].map(impact_score_map)
+        
+        # Generate mission statement
         chunk['mission_statement'] = chunk.apply(generate_mission_statement, axis=1)
-        chunk['financial_metric'] = chunk['REVENUE_AMT'].clip(lower=1)
-        chunk['impact_score_numeric'] = chunk['impact_score'].map({'Low': 1, 'Medium': 2, 'High': 3})
-        chunk['impact_efficiency'] = chunk['impact_score_numeric'] / chunk['financial_metric']
+        
+        # Set financial metric (use actual income)
+        chunk['financial_metric'] = chunk['INCOME_AMT']
+        
+        # Calculate efficiency only for valid scores and income
+        valid_mask = (
+            chunk['impact_score_numeric'].notna() & 
+            chunk['financial_metric'].notna() & 
+            (chunk['financial_metric'] > 0)
+        )
+        chunk.loc[valid_mask, 'impact_efficiency'] = (
+            chunk.loc[valid_mask, 'impact_score_numeric'] / 
+            np.log10(chunk.loc[valid_mask, 'financial_metric'] + 10)
+        )
+    
     return chunk
 
 def generate_funder_history(grants_df: pd.DataFrame, nonprofits_df: pd.DataFrame) -> Dict:
@@ -121,58 +166,55 @@ def generate_funder_history(grants_df: pd.DataFrame, nonprofits_df: pd.DataFrame
         logger.error(f"Error in generate_funder_history: {str(e)}")
         return {}
 
-def assess_data_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assess data quality by checking for missing critical fields and assign confidence scores.
-    Critical fields are weighted as follows:
-    - mission_statement: 40%, INCOME_AMT/REVENUE_AMT: 30%, impact_score: 20%, Other fields (NAME, EIN, NTEE_CD): 10%
-    """
-    quality_df = df.copy() # Initialize quality metrics
-    if 'EIN' in quality_df.columns: # Ensure EIN remains as string
-        quality_df['EIN'] = quality_df['EIN'].astype(str)
-    numeric_cols = ['INCOME_AMT', 'REVENUE_AMT']
-    for col in numeric_cols: # Ensure numeric columns are properly converted
-        if col in quality_df.columns:
-            quality_df[col] = pd.to_numeric(quality_df[col], errors='coerce')
-    field_weights = { # Define critical fields and their weights
-        'mission_statement': 0.4, 'financial': 0.3,  # Combined INCOME_AMT and REVENUE_AMT
-        'impact_score': 0.2, 'basic': 0.1      # Combined NAME, EIN, NTEE_CD
-    }
-    # Check mission statement
-    quality_df['has_mission'] = quality_df['mission_statement'].notna() & \
-                               (quality_df['mission_statement'].str.len() > 10)
-    # Check financial data
-    quality_df['has_financial'] = quality_df[['INCOME_AMT', 'REVENUE_AMT']].notna().any(axis=1) & \
-                                 (quality_df[['INCOME_AMT', 'REVENUE_AMT']].fillna(0) > 0).any(axis=1)
-    quality_df['has_impact'] = quality_df['impact_score'].notna() # Check impact score
-    # Check basic info
-    quality_df['has_basic'] = quality_df[['NAME', 'EIN', 'NTEE_CD']].notna().all(axis=1)
-    quality_df['confidence_score'] = ( # Calculate confidence score
-        quality_df['has_mission'].astype(float) * field_weights['mission_statement'] +
-        quality_df['has_financial'].astype(float) * field_weights['financial'] +
-        quality_df['has_impact'].astype(float) * field_weights['impact_score'] +
-        quality_df['has_basic'].astype(float) * field_weights['basic'])
-    quality_df['data_quality'] = pd.cut( # Assign quality level
-        quality_df['confidence_score'],
-        bins=[-float('inf'), 0.3, 0.6, 0.8, float('inf')],
-        labels=['poor', 'fair', 'good', 'excellent'])
-    # List missing fields
-    def get_missing_fields(row: pd.Series) -> Set[str]:
-        missing = set()
+def assess_data_quality(df):
+    """Assess data quality for each nonprofit."""
+    quality_df = df.copy()
+    
+    # Check for required fields
+    quality_df['has_name'] = quality_df['NAME'].notna()
+    quality_df['has_mission'] = quality_df['mission_statement'].notna() & (quality_df['mission_statement'].str.len() > 10)
+    quality_df['has_ein'] = quality_df['EIN'].notna()
+    quality_df['has_ntee'] = quality_df['NTEE_CD'].notna()
+    
+    # Check financial data - consider an organization to have financial data if it has a valid income amount
+    quality_df['has_financial'] = quality_df['INCOME_AMT'].notna() & (quality_df['INCOME_AMT'] > 0)
+    
+    # Calculate quality score (weighted average)
+    # Weights:
+    # - mission_statement: 40%, INCOME_AMT: 30%, impact_score: 20%, Other fields (NAME, EIN, NTEE_CD): 10%
+    quality_df['quality_score'] = (
+        0.4 * quality_df['has_mission'].astype(float) +
+        0.3 * quality_df['has_financial'].astype(float) +
+        0.2 * quality_df['impact_score'].notna().astype(float) +
+        0.1 * (quality_df['has_name'] & quality_df['has_ein'] & quality_df['has_ntee']).astype(float)
+    )
+    
+    # Assign quality levels
+    quality_df['data_quality'] = pd.cut(
+        quality_df['quality_score'],
+        bins=[-float('inf'), 0.3, 0.5, 0.7, float('inf')],
+        labels=['poor', 'fair', 'good', 'excellent']
+    )
+    
+    # Generate missing fields list
+    def get_missing_fields(row):
+        missing = []
         if not row['has_mission']:
-            missing.add('mission_statement')
+            missing.append('mission_statement')
         if not row['has_financial']:
-            missing.add('financial_data')
-        if not row['has_impact']:
-            missing.add('impact_score')
-        if not row['has_basic']:
-            missing.add('basic_info')
-        return missing    
+            missing.append('financial_data')
+        if not row['impact_score']:
+            missing.append('impact_score')
+        if not (row['has_name'] and row['has_ein'] and row['has_ntee']):
+            missing.append('basic_info')
+        return ', '.join(missing) if missing else 'None'
+    
     quality_df['missing_fields'] = quality_df.apply(get_missing_fields, axis=1)
-    # Return only necessary columns, ensuring EIN is string
-    result_df = quality_df[['NAME', 'EIN', 'confidence_score', 'data_quality', 
-                           'missing_fields', 'has_mission', 'has_financial',  'has_impact', 'has_basic']]
+    
+    # Keep only necessary columns
+    result_df = quality_df[['EIN', 'NAME', 'data_quality', 'quality_score', 'missing_fields']]
     result_df['EIN'] = result_df['EIN'].astype(str)
+    
     return result_df
 
 def detect_anomalous_impact_scores(df: pd.DataFrame, iqr_multiplier: float = 1.0) -> pd.DataFrame:
@@ -187,19 +229,19 @@ def detect_anomalous_impact_scores(df: pd.DataFrame, iqr_multiplier: float = 1.0
         impact_score_map = {'Low': 1, 'Medium': 2, 'High': 3} # Convert impact score categories to numeric values and handle missing values
         df['impact_score'] = df['impact_score'].fillna('Medium')  # Default missing scores to Medium instead of Low
         df['impact_score_numeric'] = df['impact_score'].map(impact_score_map).fillna(2)  # Default to 2 if mapping fails
-        # Handle revenue data - convert to numeric and handle missing/zero values
-        df['REVENUE_AMT'] = pd.to_numeric(df['REVENUE_AMT'], errors='coerce').fillna(0)
-        # Set minimum revenue to $1 to avoid division by zero
-        df['financial_metric'] = df['REVENUE_AMT'].clip(lower=1)
-        df['revenue_percentile'] = df['REVENUE_AMT'].rank(pct=True)
-        # Calculate multiple anomaly indicators - 1. Impact Efficiency (impact score relative to revenue)
+        # Handle income data - convert to numeric and handle missing/zero values
+        df['INCOME_AMT'] = pd.to_numeric(df['INCOME_AMT'], errors='coerce').fillna(0)
+        # Set minimum income to $1 to avoid division by zero
+        df['financial_metric'] = df['INCOME_AMT'].clip(lower=1)
+        df['income_percentile'] = df['INCOME_AMT'].rank(pct=True)
+        # Calculate multiple anomaly indicators - 1. Impact Efficiency (impact score relative to income)
         df['impact_efficiency'] = df['impact_score_numeric'] / np.log10(df['financial_metric'] + 10)
-        # 2. Revenue Discrepancy (unusually low/high revenue)
-        revenue_mean = df['REVENUE_AMT'].mean()
-        revenue_std = df['REVENUE_AMT'].std()
-        df['revenue_zscore'] = (df['REVENUE_AMT'] - revenue_mean) / revenue_std
-        # 3. Impact Score vs Revenue Mismatch
-        df['expected_impact'] = pd.qcut(df['revenue_percentile'], q=3, 
+        # 2. Income Discrepancy (unusually low/high income)
+        income_mean = df['INCOME_AMT'].mean()
+        income_std = df['INCOME_AMT'].std()
+        df['income_zscore'] = (df['INCOME_AMT'] - income_mean) / income_std
+        # 3. Impact Score vs Income Mismatch
+        df['expected_impact'] = pd.qcut(df['income_percentile'], q=3, 
                                       labels=['Low', 'Medium', 'High'])
         df['impact_mismatch'] = df['impact_score'] != df['expected_impact']
         # Remove any remaining infinite or NaN values
@@ -214,14 +256,14 @@ def detect_anomalous_impact_scores(df: pd.DataFrame, iqr_multiplier: float = 1.0
             df['is_anomalous'] = (  # Flag anomalies based on multiple criteria with more sensitive thresholds
                 # High impact efficiency
                 (df['impact_efficiency'] > Q3 + 1.5 * IQR) |  # Changed from efficiency_threshold
-                (df['revenue_zscore'].abs() > 2) | # Extreme revenue
-                ((df['impact_score'] == 'High') & (df['revenue_percentile'] < 0.2)) | # High impact score with low revenue
-                ((df['impact_score'] == 'Low') & (df['revenue_percentile'] > 0.8))  # Low impact score with high revenue
+                (df['income_zscore'].abs() > 2) | # Extreme income
+                ((df['impact_score'] == 'High') & (df['income_percentile'] < 0.2)) | # High impact score with low income
+                ((df['impact_score'] == 'Low') & (df['income_percentile'] > 0.8))  # Low impact score with high income
                 )
             df['anomaly_score'] = ( # Calculate anomaly scores
                 # Normalize and combine multiple factors
                 0.4 * ((df['impact_efficiency'] - Q3) / IQR) +
-                0.3 * df['revenue_zscore'].abs() +
+                0.3 * df['income_zscore'].abs() +
                 0.3 * df['impact_mismatch'].astype(int))
             df['risk_level'] = pd.cut( # Assign risk levels based on anomaly score
                 df['anomaly_score'],
@@ -229,9 +271,9 @@ def detect_anomalous_impact_scores(df: pd.DataFrame, iqr_multiplier: float = 1.0
                 labels=['Low', 'Medium', 'High', 'Critical'])
             df['anomaly_type'] = 'normal' # Add detailed flags
             df.loc[df['is_anomalous'] & (df['impact_efficiency'] > Q3 + 1.5 * IQR), 'anomaly_type'] = 'high_impact_low_finance'
-            df.loc[df['is_anomalous'] & (df['revenue_zscore'].abs() > 2), 'anomaly_type'] = 'extreme_revenue'
-            df.loc[df['is_anomalous'] & ((df['impact_score'] == 'High') & (df['revenue_percentile'] < 0.2)), 'anomaly_type'] = 'suspicious_high_impact'
-            df.loc[df['is_anomalous'] & ((df['impact_score'] == 'Low') & (df['revenue_percentile'] > 0.8)), 'anomaly_type'] = 'suspicious_low_impact'
+            df.loc[df['is_anomalous'] & (df['income_zscore'].abs() > 2), 'anomaly_type'] = 'extreme_income'
+            df.loc[df['is_anomalous'] & ((df['impact_score'] == 'High') & (df['income_percentile'] < 0.2)), 'anomaly_type'] = 'suspicious_high_impact'
+            df.loc[df['is_anomalous'] & ((df['impact_score'] == 'Low') & (df['income_percentile'] > 0.8)), 'anomaly_type'] = 'suspicious_low_impact'
         else:
             print("\nWarning: No valid efficiency values found for IQR analysis")
             df['is_anomalous'] = False
@@ -248,79 +290,31 @@ def detect_anomalous_impact_scores(df: pd.DataFrame, iqr_multiplier: float = 1.0
         print(f"Exception details: {str(e)}")
         raise
 
-def process_data(df: pd.DataFrame, is_grant: bool = True) -> pd.DataFrame:
-    """Process data in chunks without multiprocessing."""
-    chunk_size = 1000
-    processed_chunks = []
-    for i in tqdm(range(0, len(df), chunk_size), desc="Processing " + ("grants" if is_grant else "nonprofits")):
-        chunk = df[i:i + chunk_size]
-        processed_chunk = process_chunk(chunk, is_grant)
-        processed_chunks.append(processed_chunk)
-        del chunk # Free memory
-        gc.collect()
-    result = pd.concat(processed_chunks, ignore_index=True)
-    del processed_chunks
-    gc.collect()
-    return result
-
-def main():
-    """Main function to process datasets."""
-    try:
-        logger.info("Starting dataset generation...")
-        dtypes = { # Define dtypes for efficient memory usage
-            'NAME': 'string', 'EIN': 'string', 'NTEE_CD': 'string', 
-            'CITY': 'string', 'STATE': 'string', 'ZIP': 'string',
-            'REVENUE_AMT': 'float32', 'ASSET_AMT': 'float32', 'INCOME_AMT': 'float32'}
-        logger.info("Processing grants data...") # Read and process grants
-        grants_df = pd.read_csv('data/grants.csv', low_memory=False)
-        grants_df = process_data(grants_df, is_grant=True)
-        grants_df.to_csv('data/grants_final.csv', index=False)
-        gc.collect() # Free memory
-        logger.info("Processing nonprofits data...") # Read and process nonprofits
-        nonprofits_df = pd.read_csv(
-            'data/non-profits.csv', dtype=dtypes,
-            na_values=['', 'nan', 'NaN', 'NULL'], low_memory=False)
-        nonprofits_df = process_data(nonprofits_df, is_grant=False) # Process nonprofits data
-        logger.info("Assessing nonprofit data quality...") # Assess data quality
-        quality_df = assess_data_quality(nonprofits_df)
-        quality_df.to_csv('data/nonprofit_quality.csv', index=False)
-        quality_summary = quality_df['data_quality'].value_counts()
-        logger.info("Data quality summary:")
-        for quality_level, count in quality_summary.items():
-            logger.info(f"{quality_level}: {count} nonprofits")
-        logger.info("Analyzing impact score anomalies...") # Detect anomalous impact scores (use a lower confidence threshold)
-        confidence_threshold = 0.5  # Lower threshold to include more data
-        high_confidence_df = nonprofits_df[quality_df['confidence_score'] >= confidence_threshold].copy()
-        anomalies_df = detect_anomalous_impact_scores(high_confidence_df)
-        anomalies_df.to_csv('data/nonprofit_anomalies.csv', index=False)
-        logger.info(f"Found {anomalies_df['is_anomalous'].sum()} anomalous nonprofits")
-        logger.info("Generating funder history...") # Generate and save data
-        try:
-            funder_history = generate_funder_history(grants_df, nonprofits_df)
-            if not funder_history:
-                logger.warning("Generated funder history is empty!")
-            logger.info("Saving funder history...")
-            with open('data/funder_history.json', 'w') as f:
-                json.dump(funder_history, f, indent=2)
-            with open('data/funder_history.json', 'r') as f: # Verify the save
-                saved_data = json.load(f)
-                if not saved_data:
-                    logger.warning("Saved funder history is empty!")
-                else:
-                    logger.info(f"Successfully saved funder history with {len(saved_data)} agencies")
-        except Exception as e:
-            logger.error(f"Error generating/saving funder history: {str(e)}", exc_info=True)
-            if funder_history: # Create a backup of any generated data
-                with open('data/funder_history.backup.json', 'w') as f:
-                    json.dump(funder_history, f, indent=2)
-        logger.info("Saving processed datasets...")
-        nonprofits_df.to_csv('data/non-profits_final.csv', index=False)
-        del grants_df, nonprofits_df, quality_df, anomalies_df, funder_history # Free memory
-        gc.collect()
-        logger.info("Dataset generation completed successfully!")
-    except Exception as e:
-        logger.error(f"Error during dataset generation: {str(e)}", exc_info=True)
-        raise
+def process_data():
+    """Process and save the final datasets."""
+    logger.info("Loading and processing data...")
+    
+    # Load and process nonprofits data
+    nonprofits_df = pd.read_csv('data/non-profits.csv')
+    nonprofits_df = process_chunk(nonprofits_df, is_grant=False)
+    nonprofits_df.to_csv('data/non-profits_final.csv', index=False)
+    logger.info("Saved processed nonprofits data")
+    
+    # Load and process grants data
+    grants_df = pd.read_csv('data/grants.csv')
+    grants_df = process_chunk(grants_df, is_grant=True)
+    grants_df.to_csv('data/grants_final.csv', index=False)
+    logger.info("Saved processed grants data")
+    
+    # Generate quality data
+    quality_df = assess_data_quality(nonprofits_df)
+    quality_df.to_csv('data/nonprofit_quality.csv', index=False)
+    logger.info("Saved nonprofit quality data")
+    
+    # Generate anomaly data
+    anomalies_df = detect_anomalous_impact_scores(nonprofits_df)
+    anomalies_df.to_csv('data/nonprofit_anomalies.csv', index=False)
+    logger.info("Saved nonprofit anomalies data")
 
 if __name__ == "__main__":
-    main() 
+    process_data() 
